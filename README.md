@@ -27,6 +27,18 @@ The map below the list shows each display in its own color, with its name and si
 
 macOS asks for Accessibility access the first time.
 
+## Android Mirroring
+
+**Android Mirroring** lists phones detected by `adb`. Connect a phone with USB
+debugging enabled, approve the prompt on the phone, then choose **Mirror
+&lt;phone&gt;**. Choose it again to stop, or use **Stop All Mirrors**.
+
+Install the command-line tools with:
+
+```sh
+brew install scrcpy android-platform-tools
+```
+
 ## Build
 
 Xcode Command Line Tools are enough.

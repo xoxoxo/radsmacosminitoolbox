@@ -299,12 +299,71 @@ static int printStatus(void) {
     return 0;
 }
 
+@interface AndroidDevice : NSObject
+@property(copy) NSString *serial;
+@property(copy) NSString *name;
+@property(copy) NSString *state;
+@end
+
+@implementation AndroidDevice
+@end
+
+static NSString *toolPath(NSString *name) {
+    for (NSString *directory in @[@"/opt/homebrew/bin", @"/usr/local/bin", @"/usr/bin"]) {
+        NSString *path = [directory stringByAppendingPathComponent:name];
+        if ([NSFileManager.defaultManager isExecutableFileAtPath:path]) return path;
+    }
+    return nil;
+}
+
+static NSArray<AndroidDevice *> *androidDevices(void) {
+    NSString *adb = toolPath(@"adb");
+    if (!adb) return @[];
+
+    NSTask *task = [NSTask new];
+    NSPipe *output = [NSPipe pipe];
+    task.executableURL = [NSURL fileURLWithPath:adb];
+    task.arguments = @[@"devices", @"-l"];
+    task.standardOutput = output;
+    task.standardError = [NSPipe pipe];
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) return @[];
+    [task waitUntilExit];
+
+    NSData *data = [output.fileHandleForReading readDataToEndOfFile];
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+    NSMutableArray<AndroidDevice *> *devices = [NSMutableArray array];
+    NSCharacterSet *space = NSCharacterSet.whitespaceCharacterSet;
+    for (NSString *line in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        if (!line.length || [line hasPrefix:@"List of devices"]) continue;
+        NSMutableArray<NSString *> *fields = [NSMutableArray array];
+        for (NSString *field in [line componentsSeparatedByCharactersInSet:space]) {
+            if (field.length) [fields addObject:field];
+        }
+        if (fields.count < 2) continue;
+        AndroidDevice *device = [AndroidDevice new];
+        device.serial = fields[0];
+        device.state = fields[1];
+        device.name = device.serial;
+        for (NSString *field in fields) {
+            if ([field hasPrefix:@"model:"] && field.length > 6) {
+                device.name = [[field substringFromIndex:6] stringByReplacingOccurrencesOfString:@"_" withString:@" "];
+                break;
+            }
+        }
+        [devices addObject:device];
+    }
+    return devices;
+}
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property NSStatusItem *statusItem;
 @property BOOL applying;
 @property BOOL confirming;
 @property(strong) NSObject *windowMover;
+@property(strong) NSMutableDictionary<NSString *, NSTask *> *mirrorTasks;
 - (void)scheduleRefresh;
+- (void)buildAndroidMenu:(NSMenu *)menu;
 @end
 
 // Accessibility window coordinates start at the top-left of the primary display
@@ -1329,6 +1388,7 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    self.mirrorTasks = [NSMutableDictionary dictionary];
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     if ([defaults objectForKey:kForceKey] == nil) {
         [defaults setBool:YES forKey:kForceKey];
@@ -1407,6 +1467,12 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     [menu addItem:[NSMenuItem separatorItem]];
     NSMenuItem *move = [menu addItemWithTitle:@"App Window Fixer…" action:@selector(openWindowMover:) keyEquivalent:@""];
     move.target = self;
+
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *android = [menu addItemWithTitle:@"Android Mirroring" action:nil keyEquivalent:@""];
+    NSMenu *androidMenu = [NSMenu new];
+    android.submenu = androidMenu;
+    [self buildAndroidMenu:androidMenu];
 
     [menu addItem:[NSMenuItem separatorItem]];
     NSMenuItem *keep = [menu addItemWithTitle:@"Keep Forcing RGB" action:@selector(toggleKeep:) keyEquivalent:@""];
@@ -1517,6 +1583,117 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     (void)sender;
     if (!self.windowMover) self.windowMover = [WindowMover new];
     [(WindowMover *)self.windowMover show];
+}
+
+- (void)buildAndroidMenu:(NSMenu *)menu {
+    for (NSString *serial in self.mirrorTasks.allKeys.copy) {
+        if (!self.mirrorTasks[serial].running) [self.mirrorTasks removeObjectForKey:serial];
+    }
+
+    if (!toolPath(@"adb")) {
+        NSMenuItem *missing = [menu addItemWithTitle:@"adb not found — install android-platform-tools"
+                                             action:nil
+                                      keyEquivalent:@""];
+        missing.enabled = NO;
+        return;
+    }
+    if (!toolPath(@"scrcpy")) {
+        NSMenuItem *missing = [menu addItemWithTitle:@"scrcpy not found — run: brew install scrcpy"
+                                             action:nil
+                                      keyEquivalent:@""];
+        missing.enabled = NO;
+        return;
+    }
+
+    NSArray<AndroidDevice *> *devices = androidDevices();
+    if (devices.count == 0) {
+        NSMenuItem *empty = [menu addItemWithTitle:@"No Android devices found" action:nil keyEquivalent:@""];
+        empty.enabled = NO;
+        NSMenuItem *hint = [menu addItemWithTitle:@"Connect a phone with USB debugging enabled"
+                                          action:nil
+                                   keyEquivalent:@""];
+        hint.enabled = NO;
+    }
+
+    for (AndroidDevice *device in devices) {
+        NSTask *running = self.mirrorTasks[device.serial];
+        NSString *title;
+        BOOL enabled = YES;
+        if (running.running) {
+            title = [@"Stop " stringByAppendingString:device.name];
+        } else if ([device.state isEqualToString:@"device"]) {
+            title = [@"Mirror " stringByAppendingString:device.name];
+        } else if ([device.state isEqualToString:@"unauthorized"]) {
+            title = [device.name stringByAppendingString:@" — approve USB debugging"];
+            enabled = NO;
+        } else {
+            title = [NSString stringWithFormat:@"%@ — %@", device.name, device.state];
+            enabled = NO;
+        }
+        NSMenuItem *item = [menu addItemWithTitle:title action:@selector(toggleMirror:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = device;
+        item.enabled = enabled;
+    }
+
+    if (self.mirrorTasks.count) {
+        [menu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *stop = [menu addItemWithTitle:@"Stop All Mirrors"
+                                          action:@selector(stopAllMirrors:)
+                                   keyEquivalent:@""];
+        stop.target = self;
+    }
+}
+
+- (void)toggleMirror:(NSMenuItem *)sender {
+    AndroidDevice *device = sender.representedObject;
+    if (!device) return;
+    NSTask *existing = self.mirrorTasks[device.serial];
+    if (existing.running) {
+        [existing terminate];
+        [self.mirrorTasks removeObjectForKey:device.serial];
+        return;
+    }
+
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:toolPath(@"scrcpy")];
+    task.arguments = @[@"--serial", device.serial, @"--window-title", device.name];
+    NSError *error = nil;
+    if ([task launchAndReturnError:&error]) {
+        self.mirrorTasks[device.serial] = task;
+        [self bringMirrorToFront:task attemptsRemaining:5];
+    } else {
+        presentAlert(@"Could not start Android mirroring", error.localizedDescription ?: @"scrcpy could not be opened.");
+    }
+}
+
+- (void)bringMirrorToFront:(NSTask *)task attemptsRemaining:(NSInteger)attempts {
+    if (!task.running) return;
+    NSRunningApplication *app =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:task.processIdentifier];
+    if (app) [app activateWithOptions:NSApplicationActivateAllWindows];
+
+    // scrcpy creates its window shortly after the process starts. Activate it
+    // again while that window is appearing so it cannot remain behind another app.
+    if (attempts > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            [self bringMirrorToFront:task attemptsRemaining:attempts - 1];
+        });
+    }
+}
+
+- (void)stopAllMirrors:(id)sender {
+    (void)sender;
+    for (NSTask *task in self.mirrorTasks.allValues) {
+        if (task.running) [task terminate];
+    }
+    [self.mirrorTasks removeAllObjects];
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+    (void)notification;
+    [self stopAllMirrors:nil];
 }
 
 - (void)toggleKeep:(id)sender {
