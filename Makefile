@@ -22,8 +22,9 @@ all:
 	clang -fobjc-arc -O2 -Wall \
 		-framework Foundation -framework AppKit -framework IOKit \
 		-framework CoreGraphics -framework ApplicationServices \
-		-framework ServiceManagement \
-		-o "$(BIN)" src/main.m
+		-framework ServiceManagement -framework SystemConfiguration \
+		-framework CoreWLAN -framework CoreLocation \
+		-o "$(BIN)" src/main.m src/machine.m
 	cp Info.plist "$(APP)/Contents/Info.plist"
 	codesign --force $(SIGN_FLAGS) "$(APP)"
 

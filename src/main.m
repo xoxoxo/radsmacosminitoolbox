@@ -1,3 +1,4 @@
+#import "machine.h"
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -358,12 +359,18 @@ static NSArray<AndroidDevice *> *androidDevices(void) {
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property NSStatusItem *statusItem;
+@property NSStatusItem *usageItem;
 @property BOOL applying;
 @property BOOL confirming;
 @property(strong) NSObject *windowMover;
 @property(strong) NSMutableDictionary<NSString *, NSTask *> *mirrorTasks;
+@property(strong) NSTimer *statsTimer;
+@property(strong) MachineStats *machine;
+@property BOOL hasExternalDisplay;
+@property BOOL signalRGB;
 - (void)scheduleRefresh;
 - (void)buildAndroidMenu:(NSMenu *)menu;
+- (void)refreshMachine;
 @end
 
 // Accessibility window coordinates start at the top-left of the primary display
@@ -1393,13 +1400,32 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     if ([defaults objectForKey:kForceKey] == nil) {
         [defaults setBool:YES forKey:kForceKey];
     }
+    // Created first so it sits to the right of RMT. Both are real status items,
+    // so each one highlights and opens on its own.
+    self.usageItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+    self.usageItem.button.imagePosition = NSImageOnly;
+    self.usageItem.button.imageScaling = NSImageScaleNone;
+    NSMenu *usageMenu = [NSMenu new];
+    usageMenu.autoenablesItems = NO;
+    usageMenu.delegate = self;
+    self.usageItem.menu = usageMenu;
+
     self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
-    self.statusItem.button.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightMedium];
+    self.statusItem.button.imagePosition = NSImageOnly;
+    self.statusItem.button.imageScaling = NSImageScaleNone;
     NSMenu *menu = [NSMenu new];
     menu.autoenablesItems = NO;
     menu.delegate = self;
     self.statusItem.menu = menu;
-    [self refreshTitle];
+    [self updateSignal];
+    [self refreshMachine];
+    // The first sample only records a baseline, so take another one right away.
+    [self performSelector:@selector(refreshMachine) withObject:nil afterDelay:0.4];
+    self.statsTimer = [NSTimer scheduledTimerWithTimeInterval:2
+                                                       target:self
+                                                     selector:@selector(refreshMachine)
+                                                     userInfo:nil
+                                                      repeats:YES];
     CGDisplayRegisterReconfigurationCallback(displayReconfigured, (__bridge void *)self);
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self
                                                        selector:@selector(scheduleRefresh)
@@ -1415,6 +1441,16 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     [self performSelector:@selector(refreshAfterChange) withObject:nil afterDelay:1.2];
 }
 
+- (void)updateSignal {
+    NSArray<DisplayState *> *displays = externalDisplays();
+    self.hasExternalDisplay = displays.count > 0;
+    BOOL rgb = self.hasExternalDisplay;
+    for (DisplayState *display in displays) {
+        if (!display.rgb) rgb = NO;
+    }
+    self.signalRGB = rgb;
+}
+
 - (void)refreshAfterChange {
     if ([NSUserDefaults.standardUserDefaults boolForKey:kForceKey]) {
         BOOL needsApply = NO;
@@ -1423,21 +1459,175 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
         }
         if (needsApply) [self forceAndConfirm];
     }
+    [self updateSignal];
     [self refreshTitle];
 }
 
-- (void)refreshTitle {
-    NSArray<DisplayState *> *displays = externalDisplays();
-    BOOL rgb = displays.count > 0;
-    for (DisplayState *display in displays) {
-        if (!display.rgb) rgb = NO;
+- (void)refreshMachine {
+    self.machine = [MachineStats snapshotRefreshingDrives:NO];
+    [self refreshTitle];
+}
+
+- (void)refreshNameButton {
+    BOOL hasDisplay = self.hasExternalDisplay;
+    BOOL rgb = self.signalRGB;
+    NSImage *image = menuBarNameImage(hasDisplay && rgb, hasDisplay && !rgb);
+    image.template = NO;
+    self.statusItem.button.image = image;
+    self.statusItem.button.title = @"";
+    NSString *tip = @"RMT";
+    if (hasDisplay) tip = rgb ? @"RMT · HDMI RGB" : @"RMT · HDMI YPbPr";
+    self.statusItem.button.toolTip = tip;
+}
+
+- (void)refreshUsageButton {
+    NSImage *image = menuBarUsageImage(self.machine);
+    image.template = NO;
+    self.usageItem.button.image = image;
+    self.usageItem.button.title = @"";
+    if (self.machine) {
+        self.usageItem.button.toolTip = [NSString stringWithFormat:@"CPU %.0f%% · GPU %.0f%% · Memory %.0f%%",
+                                         self.machine.cpuUsage, self.machine.gpuUsage, self.machine.memoryUsage];
     }
-    self.statusItem.button.title = displays.count == 0 ? @"RGB" : (rgb ? @"RGB" : @"YPbPr");
-    self.statusItem.button.toolTip = rgb ? @"HDMI output is RGB" : @"HDMI output is YPbPr";
+}
+
+- (void)refreshTitle {
+    [self refreshNameButton];
+    [self refreshUsageButton];
+}
+
+- (void)showReading:(id)sender {
+    (void)sender;
+}
+
+- (NSMenuItem *)addReading:(NSMenu *)menu title:(NSString *)title strong:(BOOL)strong color:(NSColor *)color {
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(showReading:) keyEquivalent:@""];
+    item.target = self;
+    NSFont *font = [NSFont monospacedSystemFontOfSize:13 weight:strong ? NSFontWeightSemibold : NSFontWeightRegular];
+    item.attributedTitle = [[NSAttributedString alloc] initWithString:title attributes:@{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: color ?: (strong ? NSColor.labelColor : NSColor.secondaryLabelColor),
+    }];
+    [menu addItem:item];
+    return item;
+}
+
+- (NSString *)memoryText:(uint64_t)bytes {
+    double gigabytes = (double)bytes / 1073741824.0;
+    double rounded = round(gigabytes);
+    if (fabs(gigabytes - rounded) < 0.05) return [NSString stringWithFormat:@"%.0f GB", rounded];
+    return [NSString stringWithFormat:@"%.1f GB", gigabytes];
+}
+
+- (NSString *)byteText:(double)bytes {
+    if (bytes >= 1e12) return [NSString stringWithFormat:@"%.1f TB", bytes / 1e12];
+    if (bytes >= 1e9) return [NSString stringWithFormat:@"%.1f GB", bytes / 1e9];
+    if (bytes >= 1e6) return [NSString stringWithFormat:@"%.0f MB", bytes / 1e6];
+    return [NSString stringWithFormat:@"%.0f KB", MAX(bytes, 0) / 1e3];
+}
+
+- (NSString *)warningText:(int)bits {
+    if (bits == 0) return @"None";
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if (bits & 0x01) [parts addObject:@"spare below threshold"];
+    if (bits & 0x02) [parts addObject:@"temperature"];
+    if (bits & 0x04) [parts addObject:@"reliability"];
+    if (bits & 0x08) [parts addObject:@"read-only"];
+    if (bits & 0x10) [parts addObject:@"backup failed"];
+    if (parts.count == 0) return [NSString stringWithFormat:@"0x%02x", bits];
+    NSString *text = [parts componentsJoinedByString:@", "];
+    return [[text substringToIndex:1].uppercaseString stringByAppendingString:[text substringFromIndex:1]];
+}
+
+- (void)addMachineItems:(NSMenu *)menu {
+    MachineStats *stats = self.machine;
+    if (!stats) return;
+    double hottest = NAN;
+    for (CoreReading *core in stats.cores) {
+        if (!isnan(core.temperature) && (isnan(hottest) || core.temperature > hottest)) hottest = core.temperature;
+    }
+    NSString *cpu = isnan(hottest)
+        ? [NSString stringWithFormat:@"CPU    %.0f%%", stats.cpuUsage]
+        : [NSString stringWithFormat:@"CPU    %.0f%%    %.0f°", stats.cpuUsage, hottest];
+    [self addReading:menu title:cpu strong:YES color:nil];
+    for (CoreReading *core in stats.cores) {
+        NSString *name = [core.name stringByPaddingToLength:16 withString:@" " startingAtIndex:0];
+        NSString *temperature = isnan(core.temperature) ? @"" : [NSString stringWithFormat:@"   %.0f°", core.temperature];
+        NSString *line = [NSString stringWithFormat:@"  %@ %3.0f%%%@", name, core.usage, temperature];
+        [self addReading:menu title:line strong:NO color:nil];
+    }
+    NSString *gpu = isnan(stats.gpuTemperature)
+        ? [NSString stringWithFormat:@"GPU    %.0f%%", stats.gpuUsage]
+        : [NSString stringWithFormat:@"GPU    %.0f%%    %.0f°", stats.gpuUsage, stats.gpuTemperature];
+    [self addReading:menu title:gpu strong:YES color:nil];
+    if (stats.fans.count == 1) {
+        FanReading *fan = stats.fans.firstObject;
+        [self addReading:menu title:[NSString stringWithFormat:@"Fan    %.0f rpm", fan.rpm] strong:YES color:nil];
+    } else if (stats.fans.count > 1) {
+        [self addReading:menu title:@"Fans" strong:YES color:nil];
+        for (FanReading *fan in stats.fans) {
+            NSString *name = [fan.name stringByPaddingToLength:16 withString:@" " startingAtIndex:0];
+            [self addReading:menu title:[NSString stringWithFormat:@"  %@ %4.0f rpm", name, fan.rpm] strong:NO color:nil];
+        }
+    }
+    NSString *memory = [NSString stringWithFormat:@"Memory    %.0f%%    %@ of %@",
+                        stats.memoryUsage, [self memoryText:stats.memoryUsed], [self memoryText:stats.memoryTotal]];
+    [self addReading:menu title:memory strong:YES color:nil];
+    if (!isnan(stats.batteryTemperature) || !isnan(stats.batteryCharge) || !isnan(stats.batteryHealth)) {
+        NSMutableString *battery = [NSMutableString stringWithString:@"Battery"];
+        if (!isnan(stats.batteryCharge)) [battery appendFormat:@"    %.0f%%", stats.batteryCharge];
+        if (!isnan(stats.batteryTemperature)) [battery appendFormat:@"    %.0f°", stats.batteryTemperature];
+        [self addReading:menu title:battery strong:YES color:nil];
+        if (!isnan(stats.batteryHealth)) {
+            [self addReading:menu title:[NSString stringWithFormat:@"  Health   %.0f%%", stats.batteryHealth] strong:NO color:nil];
+        }
+    }
+    for (DriveReading *drive in stats.drives) {
+        [self addReading:menu title:drive.name strong:YES color:nil];
+        NSMutableArray<NSString *> *summary = [NSMutableArray array];
+        if (!isnan(drive.temperature)) [summary addObject:[NSString stringWithFormat:@"%.0f°", drive.temperature]];
+        if (drive.freeFraction >= 0) [summary addObject:[NSString stringWithFormat:@"%.0f%% free", drive.freeFraction * 100.0]];
+        if (summary.count) {
+            [self addReading:menu title:[@"  " stringByAppendingString:[summary componentsJoinedByString:@"  ·  "]] strong:NO color:nil];
+        }
+        if (drive.hasBytesWritten) {
+            [self addReading:menu title:[NSString stringWithFormat:@"  Written  %@", [self byteText:drive.bytesWritten]] strong:NO color:nil];
+        }
+        if (!isnan(drive.health)) {
+            [self addReading:menu title:[NSString stringWithFormat:@"  Health  %.0f%%", drive.health] strong:NO color:nil];
+        }
+        if (drive.powerCycles >= 0) {
+            [self addReading:menu title:[NSString stringWithFormat:@"  Power cycles  %lld", drive.powerCycles] strong:NO color:nil];
+        }
+        if (drive.criticalWarning >= 0) {
+            NSString *warning = [self warningText:drive.criticalWarning];
+            NSColor *color = drive.criticalWarning == 0 ? nil : NSColor.systemRedColor;
+            [self addReading:menu title:[@"  Critical warnings  " stringByAppendingString:warning] strong:NO color:color];
+        }
+    }
+    if (stats.networks.count == 0) {
+        [self addReading:menu title:@"Network    Not connected" strong:YES color:nil];
+    } else if (stats.networks.count == 1) {
+        NetworkReading *network = stats.networks.firstObject;
+        [self addReading:menu title:[NSString stringWithFormat:@"%@    %@", network.kind, network.name] strong:YES color:nil];
+    } else {
+        [self addReading:menu title:@"Network" strong:YES color:nil];
+        for (NetworkReading *network in stats.networks) {
+            [self addReading:menu title:[NSString stringWithFormat:@"  %@    %@", network.kind, network.name] strong:NO color:nil];
+        }
+    }
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
     [menu removeAllItems];
+    if (menu == self.usageItem.menu) {
+        self.machine = [MachineStats snapshotRefreshingDrives:YES];
+        [self refreshUsageButton];
+        [self addMachineItems:menu];
+        return;
+    }
+    [self updateSignal];
+    [self refreshNameButton];
     NSArray<DisplayState *> *displays = externalDisplays();
     if (displays.count == 0) {
         NSMenuItem *empty = [menu addItemWithTitle:@"No external display" action:nil keyEquivalent:@""];
@@ -1498,6 +1688,7 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     if (result != kIOReturnSuccess && result != kIOReturnNotFound) {
         NSLog(@"Force RGB %@ failed: 0x%x", force ? @"apply" : @"reset", result);
     }
+    [self updateSignal];
     [self refreshTitle];
 }
 
@@ -1693,6 +1884,7 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
+    [self.statsTimer invalidate];
     [self stopAllMirrors:nil];
 }
 

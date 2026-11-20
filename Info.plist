@@ -24,5 +24,9 @@
 	<true/>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>Rads macOS Mini Toolbox lists open windows so you can move one that is stuck between displays.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>Rads macOS Mini Toolbox shows the name of the Wi-Fi network you are connected to. macOS treats that name as location information.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Rads macOS Mini Toolbox shows the name of the Wi-Fi network you are connected to. macOS treats that name as location information.</string>
 </dict>
 </plist>
