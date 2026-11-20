@@ -368,6 +368,7 @@ static NSArray<AndroidDevice *> *androidDevices(void) {
 @property(strong) MachineStats *machine;
 @property BOOL hasExternalDisplay;
 @property BOOL signalRGB;
+@property BOOL usageMenuOpen;
 - (void)scheduleRefresh;
 - (void)buildAndroidMenu:(NSMenu *)menu;
 - (void)refreshMachine;
@@ -1421,11 +1422,13 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     [self refreshMachine];
     // The first sample only records a baseline, so take another one right away.
     [self performSelector:@selector(refreshMachine) withObject:nil afterDelay:0.4];
-    self.statsTimer = [NSTimer scheduledTimerWithTimeInterval:2
-                                                       target:self
-                                                     selector:@selector(refreshMachine)
-                                                     userInfo:nil
-                                                      repeats:YES];
+    // Common modes so readings keep moving while a status menu is held open.
+    self.statsTimer = [NSTimer timerWithTimeInterval:1
+                                              target:self
+                                            selector:@selector(refreshMachine)
+                                            userInfo:nil
+                                             repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.statsTimer forMode:NSRunLoopCommonModes];
     CGDisplayRegisterReconfigurationCallback(displayReconfigured, (__bridge void *)self);
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self
                                                        selector:@selector(scheduleRefresh)
@@ -1466,6 +1469,7 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
 - (void)refreshMachine {
     self.machine = [MachineStats snapshotRefreshingDrives:NO];
     [self refreshTitle];
+    if (self.usageMenuOpen) [self reloadUsageMenu];
 }
 
 - (void)refreshNameButton {
@@ -1500,16 +1504,29 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     (void)sender;
 }
 
-- (NSMenuItem *)addReading:(NSMenu *)menu title:(NSString *)title strong:(BOOL)strong color:(NSColor *)color {
-    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(showReading:) keyEquivalent:@""];
-    item.target = self;
+- (void)styleReading:(NSMenuItem *)item title:(NSString *)title strong:(BOOL)strong color:(NSColor *)color {
+    item.title = title;
     NSFont *font = [NSFont monospacedSystemFontOfSize:13 weight:strong ? NSFontWeightSemibold : NSFontWeightRegular];
     item.attributedTitle = [[NSAttributedString alloc] initWithString:title attributes:@{
         NSFontAttributeName: font,
         NSForegroundColorAttributeName: color ?: (strong ? NSColor.labelColor : NSColor.secondaryLabelColor),
     }];
+}
+
+- (NSMenuItem *)addReading:(NSMenu *)menu title:(NSString *)title strong:(BOOL)strong color:(NSColor *)color {
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(showReading:) keyEquivalent:@""];
+    item.target = self;
+    [self styleReading:item title:title strong:strong color:color];
     [menu addItem:item];
     return item;
+}
+
+static NSDictionary *readingRow(NSString *title, BOOL strong, NSColor *color) {
+    NSMutableDictionary *row = [NSMutableDictionary dictionary];
+    row[@"title"] = title;
+    row[@"strong"] = @(strong);
+    if (color) row[@"color"] = color;
+    return row;
 }
 
 - (NSString *)memoryText:(uint64_t)bytes {
@@ -1539,9 +1556,10 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     return [[text substringToIndex:1].uppercaseString stringByAppendingString:[text substringFromIndex:1]];
 }
 
-- (void)addMachineItems:(NSMenu *)menu {
+- (NSArray<NSDictionary *> *)machineRows {
+    NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
     MachineStats *stats = self.machine;
-    if (!stats) return;
+    if (!stats) return rows;
     double hottest = NAN;
     for (CoreReading *core in stats.cores) {
         if (!isnan(core.temperature) && (isnan(hottest) || core.temperature > hottest)) hottest = core.temperature;
@@ -1549,83 +1567,105 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     NSString *cpu = isnan(hottest)
         ? [NSString stringWithFormat:@"CPU    %.0f%%", stats.cpuUsage]
         : [NSString stringWithFormat:@"CPU    %.0f%%    %.0f°", stats.cpuUsage, hottest];
-    [self addReading:menu title:cpu strong:YES color:nil];
+    [rows addObject:readingRow(cpu, YES, nil)];
     for (CoreReading *core in stats.cores) {
         NSString *name = [core.name stringByPaddingToLength:16 withString:@" " startingAtIndex:0];
         NSString *temperature = isnan(core.temperature) ? @"" : [NSString stringWithFormat:@"   %.0f°", core.temperature];
         NSString *line = [NSString stringWithFormat:@"  %@ %3.0f%%%@", name, core.usage, temperature];
-        [self addReading:menu title:line strong:NO color:nil];
+        [rows addObject:readingRow(line, NO, nil)];
     }
     NSString *gpu = isnan(stats.gpuTemperature)
         ? [NSString stringWithFormat:@"GPU    %.0f%%", stats.gpuUsage]
         : [NSString stringWithFormat:@"GPU    %.0f%%    %.0f°", stats.gpuUsage, stats.gpuTemperature];
-    [self addReading:menu title:gpu strong:YES color:nil];
+    [rows addObject:readingRow(gpu, YES, nil)];
     if (stats.fans.count == 1) {
         FanReading *fan = stats.fans.firstObject;
-        [self addReading:menu title:[NSString stringWithFormat:@"Fan    %.0f rpm", fan.rpm] strong:YES color:nil];
+        [rows addObject:readingRow([NSString stringWithFormat:@"Fan    %.0f rpm", fan.rpm], YES, nil)];
     } else if (stats.fans.count > 1) {
-        [self addReading:menu title:@"Fans" strong:YES color:nil];
+        [rows addObject:readingRow(@"Fans", YES, nil)];
         for (FanReading *fan in stats.fans) {
             NSString *name = [fan.name stringByPaddingToLength:16 withString:@" " startingAtIndex:0];
-            [self addReading:menu title:[NSString stringWithFormat:@"  %@ %4.0f rpm", name, fan.rpm] strong:NO color:nil];
+            [rows addObject:readingRow([NSString stringWithFormat:@"  %@ %4.0f rpm", name, fan.rpm], NO, nil)];
         }
     }
     NSString *memory = [NSString stringWithFormat:@"Memory    %.0f%%    %@ of %@",
                         stats.memoryUsage, [self memoryText:stats.memoryUsed], [self memoryText:stats.memoryTotal]];
-    [self addReading:menu title:memory strong:YES color:nil];
+    [rows addObject:readingRow(memory, YES, nil)];
     if (!isnan(stats.batteryTemperature) || !isnan(stats.batteryCharge) || !isnan(stats.batteryHealth)) {
         NSMutableString *battery = [NSMutableString stringWithString:@"Battery"];
         if (!isnan(stats.batteryCharge)) [battery appendFormat:@"    %.0f%%", stats.batteryCharge];
         if (!isnan(stats.batteryTemperature)) [battery appendFormat:@"    %.0f°", stats.batteryTemperature];
-        [self addReading:menu title:battery strong:YES color:nil];
+        [rows addObject:readingRow(battery, YES, nil)];
         if (!isnan(stats.batteryHealth)) {
-            [self addReading:menu title:[NSString stringWithFormat:@"  Health   %.0f%%", stats.batteryHealth] strong:NO color:nil];
+            [rows addObject:readingRow([NSString stringWithFormat:@"  Health   %.0f%%", stats.batteryHealth], NO, nil)];
         }
     }
     for (DriveReading *drive in stats.drives) {
-        [self addReading:menu title:drive.name strong:YES color:nil];
+        [rows addObject:readingRow(drive.name, YES, nil)];
         NSMutableArray<NSString *> *summary = [NSMutableArray array];
         if (!isnan(drive.temperature)) [summary addObject:[NSString stringWithFormat:@"%.0f°", drive.temperature]];
         if (drive.freeFraction >= 0) [summary addObject:[NSString stringWithFormat:@"%.0f%% free", drive.freeFraction * 100.0]];
         if (summary.count) {
-            [self addReading:menu title:[@"  " stringByAppendingString:[summary componentsJoinedByString:@"  ·  "]] strong:NO color:nil];
+            [rows addObject:readingRow([@"  " stringByAppendingString:[summary componentsJoinedByString:@"  ·  "]], NO, nil)];
         }
         if (drive.hasBytesWritten) {
-            [self addReading:menu title:[NSString stringWithFormat:@"  Written  %@", [self byteText:drive.bytesWritten]] strong:NO color:nil];
+            [rows addObject:readingRow([NSString stringWithFormat:@"  Written  %@", [self byteText:drive.bytesWritten]], NO, nil)];
         }
         if (!isnan(drive.health)) {
-            [self addReading:menu title:[NSString stringWithFormat:@"  Health  %.0f%%", drive.health] strong:NO color:nil];
+            [rows addObject:readingRow([NSString stringWithFormat:@"  Health  %.0f%%", drive.health], NO, nil)];
         }
         if (drive.powerCycles >= 0) {
-            [self addReading:menu title:[NSString stringWithFormat:@"  Power cycles  %lld", drive.powerCycles] strong:NO color:nil];
+            [rows addObject:readingRow([NSString stringWithFormat:@"  Power cycles  %lld", drive.powerCycles], NO, nil)];
         }
         if (drive.criticalWarning >= 0) {
             NSString *warning = [self warningText:drive.criticalWarning];
             NSColor *color = drive.criticalWarning == 0 ? nil : NSColor.systemRedColor;
-            [self addReading:menu title:[@"  Critical warnings  " stringByAppendingString:warning] strong:NO color:color];
+            [rows addObject:readingRow([@"  Critical warnings  " stringByAppendingString:warning], NO, color)];
         }
     }
     if (stats.networks.count == 0) {
-        [self addReading:menu title:@"Network    Not connected" strong:YES color:nil];
+        [rows addObject:readingRow(@"Network    Not connected", YES, nil)];
     } else if (stats.networks.count == 1) {
         NetworkReading *network = stats.networks.firstObject;
-        [self addReading:menu title:[NSString stringWithFormat:@"%@    %@", network.kind, network.name] strong:YES color:nil];
+        [rows addObject:readingRow([NSString stringWithFormat:@"%@    %@", network.kind, network.name], YES, nil)];
     } else {
-        [self addReading:menu title:@"Network" strong:YES color:nil];
+        [rows addObject:readingRow(@"Network", YES, nil)];
         for (NetworkReading *network in stats.networks) {
-            [self addReading:menu title:[NSString stringWithFormat:@"  %@    %@", network.kind, network.name] strong:NO color:nil];
+            [rows addObject:readingRow([NSString stringWithFormat:@"  %@    %@", network.kind, network.name], NO, nil)];
         }
+    }
+    return rows;
+}
+
+- (void)reloadUsageMenu {
+    NSMenu *menu = self.usageItem.menu;
+    NSArray<NSDictionary *> *rows = [self machineRows];
+    while (menu.numberOfItems > (NSInteger)rows.count) {
+        [menu removeItemAtIndex:menu.numberOfItems - 1];
+    }
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        NSDictionary *row = rows[i];
+        NSMenuItem *item;
+        if ((NSInteger)i < menu.numberOfItems) {
+            item = [menu itemAtIndex:i];
+        } else {
+            item = [[NSMenuItem alloc] initWithTitle:@"" action:@selector(showReading:) keyEquivalent:@""];
+            item.target = self;
+            [menu addItem:item];
+        }
+        [self styleReading:item title:row[@"title"] strong:[row[@"strong"] boolValue] color:row[@"color"]];
     }
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
-    [menu removeAllItems];
     if (menu == self.usageItem.menu) {
+        self.usageMenuOpen = YES;
         self.machine = [MachineStats snapshotRefreshingDrives:YES];
         [self refreshUsageButton];
-        [self addMachineItems:menu];
+        [self reloadUsageMenu];
         return;
     }
+    [menu removeAllItems];
     [self updateSignal];
     [self refreshNameButton];
     NSArray<DisplayState *> *displays = externalDisplays();
@@ -1678,6 +1718,10 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     [menu addItem:[NSMenuItem separatorItem]];
     NSMenuItem *quit = [menu addItemWithTitle:[@"Quit " stringByAppendingString:kAppName] action:@selector(terminate:) keyEquivalent:@"q"];
     quit.target = NSApp;
+}
+
+- (void)menuDidClose:(NSMenu *)menu {
+    if (menu == self.usageItem.menu) self.usageMenuOpen = NO;
 }
 
 - (void)applyForce:(BOOL)force {
