@@ -39,6 +39,20 @@ Install the command-line tools with:
 brew install scrcpy android-platform-tools
 ```
 
+## Screen Recording
+
+**Record Display** (⇧⌘1) records the display under the pointer, including the pointer and system audio. **Record Region** (⇧⌘2) dims the screens so you can drag a rectangle; Esc cancels. Press either shortcut again to stop, or click the red dot in the menu bar.
+
+Recordings land on the Desktop as QuickTime movies. **Show Last Recording** selects the latest file in Finder.
+
+macOS asks for Screen Recording access the first time.
+
+## Keep Mac Awake
+
+**Keep Mac Awake** stops the Mac from going to sleep while it is on. Sleep and wake cycles can power-cycle an external NVMe drive, so keeping the Mac awake keeps the drive powered. The display can still turn off. It is off by default and is remembered between launches.
+
+It holds a system-sleep power assertion, so the Mac will also stay awake on battery while the option is on. Turn it off to let the Mac sleep again.
+
 ## Build
 
 Xcode Command Line Tools are enough.

@@ -1,8 +1,11 @@
 #import "machine.h"
+#import "recorder.h"
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <Carbon/Carbon.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOKit/IOKitLib.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <dlfcn.h>
 #import <math.h>
@@ -32,6 +35,7 @@ enum {
 static NSString *const kForceKey = @"ForceRGBEnabled";
 static NSString *const kAppName = @"Rads macOS Mini Toolbox";
 static NSString *const kConfirmedKey = @"ConfirmedRGBDisplays";
+static NSString *const kKeepAwakeKey = @"KeepMacAwakeEnabled";
 static const NSInteger kConfirmSeconds = 15;
 
 static IOAVCreateFn gCreate;
@@ -357,12 +361,42 @@ static NSArray<AndroidDevice *> *androidDevices(void) {
     return devices;
 }
 
+// Holding a system-sleep assertion stops idle and maintenance sleep, so the Mac
+// never power-cycles a Thunderbolt/NVMe drive by sleeping. The assertion is
+// released automatically when the app quits.
+static IOPMAssertionID gKeepAwakeAssertion = kIOPMNullAssertionID;
+
+static void setKeepAwake(BOOL on) {
+    if (on && gKeepAwakeAssertion == kIOPMNullAssertionID) {
+        IOPMAssertionID assertion = kIOPMNullAssertionID;
+        IOReturn result = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventSystemSleep,
+                                                      kIOPMAssertionLevelOn,
+                                                      CFSTR("Keep Mac Awake for external drives"),
+                                                      &assertion);
+        if (result == kIOReturnSuccess) {
+            gKeepAwakeAssertion = assertion;
+        } else {
+            NSLog(@"Keep Mac Awake failed: 0x%x", result);
+        }
+    } else if (!on && gKeepAwakeAssertion != kIOPMNullAssertionID) {
+        IOPMAssertionRelease(gKeepAwakeAssertion);
+        gKeepAwakeAssertion = kIOPMNullAssertionID;
+    }
+}
+
+enum {
+    kHotKeyRecordDisplay = 1,
+    kHotKeyRecordRegion = 2,
+};
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property NSStatusItem *statusItem;
 @property NSStatusItem *usageItem;
+@property NSStatusItem *recordItem;
 @property BOOL applying;
 @property BOOL confirming;
 @property(strong) NSObject *windowMover;
+@property(strong) ScreenRecorder *recorder;
 @property(strong) NSMutableDictionary<NSString *, NSTask *> *mirrorTasks;
 @property(strong) NSTimer *statsTimer;
 @property(strong) MachineStats *machine;
@@ -372,6 +406,8 @@ static NSArray<AndroidDevice *> *androidDevices(void) {
 - (void)scheduleRefresh;
 - (void)buildAndroidMenu:(NSMenu *)menu;
 - (void)refreshMachine;
+- (void)recordDisplay:(id)sender;
+- (void)recordRegion:(id)sender;
 @end
 
 // Accessibility window coordinates start at the top-left of the primary display
@@ -1418,6 +1454,24 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     menu.autoenablesItems = NO;
     menu.delegate = self;
     self.statusItem.menu = menu;
+
+    self.recordItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
+    self.recordItem.button.imagePosition = NSImageOnly;
+    self.recordItem.button.imageScaling = NSImageScaleNone;
+    NSImage *recordImage = recordingStatusImage();
+    recordImage.template = NO;
+    self.recordItem.button.image = recordImage;
+    self.recordItem.button.toolTip = @"Stop screen recording";
+    self.recordItem.button.target = self;
+    self.recordItem.button.action = @selector(stopRecording:);
+    self.recordItem.visible = NO;
+
+    self.recorder = [ScreenRecorder new];
+    __weak AppDelegate *weakSelf = self;
+    self.recorder.onStateChange = ^{
+        [weakSelf recordingStateChanged];
+    };
+    [self registerRecordingHotKeys];
     [self updateSignal];
     [self refreshMachine];
     // The first sample only records a baseline, so take another one right away.
@@ -1437,6 +1491,7 @@ static void displayReconfigured(CGDirectDisplayID display, CGDisplayChangeSummar
     if ([defaults boolForKey:kForceKey]) {
         [self forceAndConfirm];
     }
+    setKeepAwake([defaults boolForKey:kKeepAwakeKey]);
 }
 
 - (void)scheduleRefresh {
@@ -1699,6 +1754,25 @@ static NSDictionary *readingRow(NSString *title, BOOL strong, NSColor *color) {
     move.target = self;
 
     [menu addItem:[NSMenuItem separatorItem]];
+    if (self.recorder.recording) {
+        NSMenuItem *stop = [menu addItemWithTitle:@"Stop Recording" action:@selector(stopRecording:) keyEquivalent:@"1"];
+        stop.target = self;
+        stop.keyEquivalentModifierMask = NSEventModifierFlagShift | NSEventModifierFlagCommand;
+    } else {
+        NSMenuItem *display = [menu addItemWithTitle:@"Record Display" action:@selector(recordDisplay:) keyEquivalent:@"1"];
+        display.target = self;
+        display.keyEquivalentModifierMask = NSEventModifierFlagShift | NSEventModifierFlagCommand;
+        NSMenuItem *region = [menu addItemWithTitle:@"Record Region" action:@selector(recordRegion:) keyEquivalent:@"2"];
+        region.target = self;
+        region.keyEquivalentModifierMask = NSEventModifierFlagShift | NSEventModifierFlagCommand;
+    }
+    if (self.recorder.lastRecordingURL) {
+        NSMenuItem *show = [menu addItemWithTitle:@"Show Last Recording" action:@selector(showLastRecording:) keyEquivalent:@""];
+        show.target = self;
+        show.enabled = [NSFileManager.defaultManager fileExistsAtPath:self.recorder.lastRecordingURL.path];
+    }
+
+    [menu addItem:[NSMenuItem separatorItem]];
     NSMenuItem *android = [menu addItemWithTitle:@"Android Mirroring" action:nil keyEquivalent:@""];
     NSMenu *androidMenu = [NSMenu new];
     android.submenu = androidMenu;
@@ -1708,6 +1782,10 @@ static NSDictionary *readingRow(NSString *title, BOOL strong, NSColor *color) {
     NSMenuItem *keep = [menu addItemWithTitle:@"Keep Forcing RGB" action:@selector(toggleKeep:) keyEquivalent:@""];
     keep.target = self;
     keep.state = [NSUserDefaults.standardUserDefaults boolForKey:kForceKey] ? NSControlStateValueOn : NSControlStateValueOff;
+
+    NSMenuItem *awake = [menu addItemWithTitle:@"Keep Mac Awake" action:@selector(toggleKeepAwake:) keyEquivalent:@""];
+    awake.target = self;
+    awake.state = [NSUserDefaults.standardUserDefaults boolForKey:kKeepAwakeKey] ? NSControlStateValueOn : NSControlStateValueOff;
 
     NSMenuItem *login = [menu addItemWithTitle:@"Open at Login" action:@selector(toggleLogin:) keyEquivalent:@""];
     login.target = self;
@@ -1820,6 +1898,61 @@ static NSDictionary *readingRow(NSString *title, BOOL strong, NSColor *color) {
     [(WindowMover *)self.windowMover show];
 }
 
+static OSStatus recordingHotKeyHandler(EventHandlerCallRef nextHandler, EventRef event, void *userData) {
+    (void)nextHandler;
+    EventHotKeyID identity;
+    GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, NULL, sizeof(identity), NULL, &identity);
+    AppDelegate *delegate = (__bridge AppDelegate *)userData;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (identity.id == kHotKeyRecordDisplay) [delegate recordDisplay:nil];
+        else if (identity.id == kHotKeyRecordRegion) [delegate recordRegion:nil];
+    });
+    return noErr;
+}
+
+- (void)registerRecordingHotKeys {
+    static EventHandlerRef handler;
+    if (!handler) {
+        EventTypeSpec spec = { kEventClassKeyboard, kEventHotKeyPressed };
+        InstallApplicationEventHandler(recordingHotKeyHandler, 1, &spec, (__bridge void *)self, &handler);
+    }
+    static EventHotKeyRef displayKey;
+    static EventHotKeyRef regionKey;
+    EventHotKeyID displayID = { 'RMT ', kHotKeyRecordDisplay };
+    EventHotKeyID regionID = { 'RMT ', kHotKeyRecordRegion };
+    RegisterEventHotKey(kVK_ANSI_1, shiftKey | cmdKey, displayID, GetApplicationEventTarget(), 0, &displayKey);
+    RegisterEventHotKey(kVK_ANSI_2, shiftKey | cmdKey, regionID, GetApplicationEventTarget(), 0, &regionKey);
+}
+
+- (void)recordingStateChanged {
+    self.recordItem.visible = self.recorder.recording;
+    if (self.recorder.recording) {
+        self.recordItem.button.toolTip = @"Stop screen recording";
+    }
+}
+
+- (void)recordDisplay:(id)sender {
+    (void)sender;
+    [self.recorder toggleDisplay];
+}
+
+- (void)recordRegion:(id)sender {
+    (void)sender;
+    [self.recorder toggleRegion];
+}
+
+- (void)stopRecording:(id)sender {
+    (void)sender;
+    [self.recorder stop];
+}
+
+- (void)showLastRecording:(id)sender {
+    (void)sender;
+    NSURL *url = self.recorder.lastRecordingURL;
+    if (!url || ![NSFileManager.defaultManager fileExistsAtPath:url.path]) return;
+    [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[url]];
+}
+
 - (void)buildAndroidMenu:(NSMenu *)menu {
     for (NSString *serial in self.mirrorTasks.allKeys.copy) {
         if (!self.mirrorTasks[serial].running) [self.mirrorTasks removeObjectForKey:serial];
@@ -1929,6 +2062,7 @@ static NSDictionary *readingRow(NSString *title, BOOL strong, NSColor *color) {
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
     [self.statsTimer invalidate];
+    [self.recorder stop];
     [self stopAllMirrors:nil];
 }
 
@@ -1937,6 +2071,13 @@ static NSDictionary *readingRow(NSString *title, BOOL strong, NSColor *color) {
     BOOL on = ![NSUserDefaults.standardUserDefaults boolForKey:kForceKey];
     [NSUserDefaults.standardUserDefaults setBool:on forKey:kForceKey];
     if (on) [self forceAndConfirm];
+}
+
+- (void)toggleKeepAwake:(id)sender {
+    (void)sender;
+    BOOL on = ![NSUserDefaults.standardUserDefaults boolForKey:kKeepAwakeKey];
+    [NSUserDefaults.standardUserDefaults setBool:on forKey:kKeepAwakeKey];
+    setKeepAwake(on);
 }
 
 - (void)toggleLogin:(id)sender {

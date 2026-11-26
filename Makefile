@@ -24,7 +24,9 @@ all:
 		-framework CoreGraphics -framework ApplicationServices \
 		-framework ServiceManagement -framework SystemConfiguration \
 		-framework CoreWLAN -framework CoreLocation \
-		-o "$(BIN)" src/main.m src/machine.m
+		-framework ScreenCaptureKit -framework AVFoundation \
+		-framework Carbon -framework CoreMedia -framework CoreVideo \
+		-o "$(BIN)" src/main.m src/machine.m src/recorder.m
 	cp Info.plist "$(APP)/Contents/Info.plist"
 	codesign --force $(SIGN_FLAGS) "$(APP)"
 
